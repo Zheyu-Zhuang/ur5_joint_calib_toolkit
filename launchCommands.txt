@@ -1,0 +1,13 @@
+
+roslaunch pointgrey_camera_driver camera.launch
+
+roslaunch zed_wrapper zed.launch
+
+rosrun testbed aruco_calib.py
+
+python aruco_calib.py
+
+rviz
+
+roslaunch ur_modern_driver ur5_ros_control.launch robot_ip:=192.168.100.1
+sudo /etc/init.d/networking restart
