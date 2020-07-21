@@ -1,119 +1,96 @@
 #!/usr/bin/env python
 
+import argparse
+import glob
+import json
 import os
-# Sys Pkg
-import sys
-import yaml
-from ur5_kin import UR5Kin
 
+import cv2
+import cv2.aruco as aruco
 # ROS Sys Pkg
 import message_filters
 import numpy as np
-import cv2
-import cv2.aruco as aruco
 import rospy
+from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import String
-from cv_bridge import CvBridge, CvBridgeError
-import copy
-import tf
-import csv
+
+# Sys Pkg
+
 bridge = CvBridge()
-cwd = os.getcwd()
-fk_ur5 = UR5Kin()
-PGREY = 1
-ZED = 2
 
-################### Initialisation ################################
-camera = ZED
-images = 30
-aruco_dict =  aruco.Dictionary_get(aruco.DICT_4X4_1000) # 4X4 = 4x4 bit markers
-charuco_board =  aruco.CharucoBoard_create( 4,6, 0.029, 0.022, aruco_dict ) # width, height (full board), square length, marker length
-##################################################################
+parser = argparse.ArgumentParser()
+#
+parser.add_argument('--dataset', type=str, help='directory for saving the data')
+#
+parser.add_argument('--aruco_bit', type=int, default=4,
+                    help='format of aruco dictionary')
+parser.add_argument('--board_dim', type=int, hnargs="+", detault=[4, 6],
+                    help='width, height of checkerboard (unit: squares)')
+parser.add_argument('--square_len', type=float, default=0.029,
+                    help='measured in metre')
+parser.add_argument('--marker_len', type=float, default=0.022,
+                    help='measured in metre')
+parser.add_argument('--camera_topic', type=str, default='/camera/image_color')
+args = parser.parse_args()
 
-if camera == "ZED":
-    camera = ZED
-if camera == "PGREY":
-    camera = PGREY
+aruco_dict = aruco.Dictionary_get(aruco.DICT_4X4_1000)  # 4X4 = 4x4 bit markers
+charuco_board = aruco.CharucoBoard_create(args.board_dim[0], args.board_dim[1],
+                                          args.square_len, args.marker_len,
+                                          aruco_dict)
 
-class chArucoCalib:
+# Todo add save images to separate table surface calibration subfolder
 
+class SampleCollector:
     def __init__(self):
-        self.q_sub = message_filters.Subscriber(
+        self.joint_sub = message_filters.Subscriber(
             "/joint_states", JointState)
-        if camera == PGREY:
-            self.image_topic = "/camera/image_color"
-            self.img_sub = message_filters.Subscriber(self.image_topic, Image)
-            self.synced_msgs = message_filters.ApproximateTimeSynchronizer(
-            [self.img_sub, self.q_sub], 10, 0.1)
-            self.synced_msgs.registerCallback(self.sync_callback)
-                        
-        elif camera == ZED:
-            self.right_image_topic = "/zed/zed_node/right/image_rect_color"
-            self.left_image_topic = "/zed/zed_node/rgb/image_rect_color"
-            self.right_img_sub = message_filters.Subscriber(self.right_image_topic, Image)
-            self.left_img_sub = message_filters.Subscriber(self.left_image_topic, Image)
-            self.synced_msgs = message_filters.ApproximateTimeSynchronizer([self.right_img_sub, self.left_img_sub, self.q_sub],10,0.1)
-            self.synced_msgs.registerCallback(self.sync_callback)
-
+        self.img_sub = message_filters.Subscriber(args.image_topic, Image)
+        self.synced_msgs = message_filters.ApproximateTimeSynchronizer(
+            [self.img_sub, self.joint_sub], 10, 0.1)
+        self.synced_msgs.registerCallback(self.sync_callback)
         self.current_markers = dict()
-        self.frame_counter = np.zeros((camera,1))
-     
-    def img_callback(self, image_msg, joint_msg, cam_id): 
-        cv2_img = bridge.imgmsg_to_cv2(image_msg) # Convert your ROS Image message to OpenCV2
-        q = self.joint_msg2q(joint_msg)
-        if self.frame_counter[cam_id] < images and self.frame_counter[cam_id]: 
-            imageName = "cam{}_{}.png".format(cam_id,int(self.frame_counter[cam_id][0]))
-            angles = ["{} {} {} {} {} {}".format(q[0][0],q[1][0],q[2][0],q[3][0],q[4][0],q[5][0])]
-            line = [angles]
-            if cam_id == 0:
-                with open('jointAngles.csv', 'a') as csvFile:
-                    writer = csv.writer(csvFile)
-                    writer.writerows(line)
-                csvFile.close
-            cv2.imwrite(imageName,cv2_img) # save images
-            self.get_corners(cv2_img, cam_id)
-            print("image: {0}/{1} - {2} total markers detected".format(self.frame_counter[cam_id], images, self.current_markers[cam_id]))       
-        elif self.frame_counter[cam_id] == images:
-            print("Data collection finished for camera {}. [Ctrl-C] to exit.".format(cam_id))
-        self.frame_counter[cam_id]+=1 
+        self.dataset_dir = os.path.join('./dataset', args.dataset)
+        self.cv2_img = None
+        self.joint_config = None
 
-    def sync_callback(self, *args):
-        image_msg = args[0]
-        if len(args)==2: # 1 cam, ur5 
-            joint_msg = args[1]
-            self.img_callback(image_msg,joint_msg,0)
-        elif len(args)==3:
-            image_msg1 = args[1]
-            joint_msg = args[2]
-            self.img_callback(image_msg,joint_msg,0)
-            self.img_callback(image_msg1,joint_msg,1)          
+    def sync_callback(self, image_msg, joint_msg):
+        self.cv2_img = bridge.imgmsg_to_cv2(image_msg)
+        self.joint_config = self.msg_to_joint_config(joint_msg)
 
-    def joint_msg2q(self, joint_msg):
+    def get_sample(self):
+        if (self.cv2_img is not None) and (self.joint_config is not None):
+            meta_dir = os.path.join(self.dataset_dir, 'meta')
+            image_dir = os.path.join(self.dataset_dir, 'images')
+            n_files = len(glob.glob1(meta_dir, "*.json"))
+            sample_id = "%03d" % n_files
+            image_file_path = os.path.join(image_dir, "%s.png" % sample_id)
+            meta_file_path = os.path.join(meta_dir, "%s.json" % sample_id)
+            dict_temp = {'image_name': "%s.png" % sample_id,
+                         'joint_config': self.joint_config.reshape(6).tolist()}
+            json.dump(dict_temp, open(meta_file_path, 'w'))
+            cv2.imwrite(image_file_path, self.cv2_img)
+
+    @staticmethod
+    def msg_to_joint_config(joint_msg):
         order = [2, 1, 0, 3, 4, 5]
         q = np.asarray([joint_msg.position[i] for i in order])
         q = np.around(q, decimals=4)
         q = q.reshape((6, 1))
         return q
-    
-    def get_corners(self,cv2_img, cam_id):
-        gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = aruco.detectMarkers(image=gray,dictionary=aruco_dict)  
-        if ids is not None and len(ids) > 5: 
-            _, Chcorners, Chids = aruco.interpolateCornersCharuco(corners, ids, gray, charuco_board )  
-            self.current_markers[cam_id] = len(Chcorners)  
-            corners, ids, _ = aruco.detectMarkers(image=gray,dictionary=aruco_dict)  
-            _, Chcorners, Chids = aruco.interpolateCornersCharuco(corners, ids, gray, charuco_board )  
-            QueryImg = aruco.drawDetectedCornersCharuco(gray, Chcorners, Chids,(0,0,255))
-            # Display our image
-            #cv2.imshow('QueryImage', QueryImg)
-            print("{} markers detected".format(len(ids)))
-            a = raw_input()    
 
-def main():
-    aruco_calib = chArucoCalib()
-    rospy.init_node("aruco_calib", anonymous=True)
-    rospy.spin()
+    @staticmethod
+    def check_corners(cv2_img):
+        gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = aruco.detectMarkers(image=gray,
+                                              dictionary=args.aruco_dict)
+        if ids is not None and len(ids) > 5:
+            print("{} markers detected".format(len(ids)))
+        else:
+            raise Exception('Need to detect more corners')
+
 
 if __name__ == "__main__":
-    main()
+    rospy.init_node("aruco_calib", anonymous=True)
+    collector = SampleCollector()
+    rospy.sleep(0.5)
+    collector.get_sample()

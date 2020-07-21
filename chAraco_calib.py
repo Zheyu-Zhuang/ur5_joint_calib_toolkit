@@ -1,324 +1,237 @@
-#!/usr/bin/env python
-
 import os
-# Sys Pkg
-import sys
 import yaml
-from ur5_kin import UR5Kin
 import math
 
 # ROS Sys Pkg
-import message_filters
+import json
+import argparse
 import numpy as np
 import cv2
 import cv2.aruco as aruco
-import rospy
-from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import String
-from cv_bridge import CvBridge, CvBridgeError
-import copy
-import tf
-import csv
-cwd = os.getcwd()
-fk_ur5 = UR5Kin()
+import glob
+from ur5_kinematics import UR5Kinematics as UR5Kin
+from tqdm import tqdm
 
-################### Initialisation ################################
-camera = 2 # number of cameras
-rootDir = "/home/zheyu/ur5_calib_toolkit/ZED/"
-robotYAML = "{}robotCalibration.yaml".format(rootDir)
-cameraYAML = "cameraCalibration.yaml"
-extrinsicDataDir = "{}calibDataset/".format(rootDir)
-tableDataDir = "{}tableCalibDataset/".format(rootDir)
-fileName = "jointAngles.csv"
-aruco_dict =  aruco.Dictionary_get(aruco.DICT_4X4_1000) # 4X4 = 4x4 bit markers
-charuco_board =  aruco.CharucoBoard_create( 4, 6, 0.063, 0.048, aruco_dict ) # width, height (full board), square length, marker length
-##################################################################
+parser = argparse.ArgumentParser()
+#
+parser.add_argument('--dataset', type=str, help='directory for saving the data')
+#
+parser.add_argument('--aruco_bit', type=int, default=4,
+                    help='format of aruco dictionary')
+parser.add_argument('--board_dim', type=int, hnargs="+", detault=[4, 6],
+                    help='width, height of checkerboard (unit: squares)')
+parser.add_argument('--square_len', type=float, default=0.029,
+                    help='measured in metre')
+parser.add_argument('--marker_len', type=float, default=0.022,
+                    help='measured in metre')
+parser.add_argument('--camera_topic', type=str, default='/camera/image_color')
+args = parser.parse_args()
 
-class chArucoCalib:
+aruco_dict = aruco.Dictionary_get(aruco.DICT_4X4_1000)  # 4X4 = 4x4 bit markers
+charuco_board = aruco.CharucoBoard_create(args.board_dim[0], args.board_dim[1],
+                                          args.square_len, args.marker_len,
+                                          aruco_dict)
+ur5_kin = UR5Kin()
 
+class MVC:
     def __init__(self):
+        # Todo: load all images and meta data from the input directory
+        self.M_X_E = np.array([[0, -1, 0, 0.23],
+                               [-1, 0, 0, 0.19],
+                               [0, 0, -1, -0.011],
+                               [0, 0, 0, 1]])
+        # offset between end-effector and table hen board is on table
+        self.board_height_offset = np.eye(4)
+        self.board_height_offset[2, 3] = -0.027
+        # offset from the ee reference frame to the calibration board
+        self.E_X_T = np.matmul(np.linalg.inv(self.M_X_E),
+                               self.board_height_offset)
+        self.cv2robotics= np.array([[0, -1, 0, 0], [0, 0, -1, 0],
+                                    [1, 0, 0, 0], [0, 0, 0, 1]])
+        self.dataset_dir = os.path.join('./dataset', args.dataset)
+        # if calibration file exist?
+        self.K = None
+        self.distortion = None
 
-        images = np.array([extrinsicDataDir + f for f in os.listdir(extrinsicDataDir) if f.endswith(".png") ])
-        order = np.argsort([int(p.split(".")[-2].split("_")[-1]) for p in images])
-        images = images[order]
-        q = []
-        with open("{}{}".format(extrinsicDataDir,fileName)) as csv_file:
-            csv_reader = csv.reader(csv_file, delimiter=' ')
-            line_count = 0
-            for row in csv_reader:
-                l = row
-                l = list(map(float, l))
-                l = np.asarray(l)
-                l = l.reshape((6, 1))
-                q.append(l)
-                line_count += 1
-        
-        imagesT = np.array([tableDataDir + f for f in os.listdir(tableDataDir) if f.endswith(".png") ])
-        order = np.argsort([int(p.split(".")[-2].split("_")[-1]) for p in imagesT])
-        imagesT = imagesT[order]
-        qT = []
-        with open("{}{}".format(tableDataDir,fileName)) as csv_file:
-            csv_reader = csv.reader(csv_file, delimiter=' ')
-            line_count = 0
-            for row in csv_reader:
-                l = row
-                l = list(map(float, l))
-                l = np.asarray(l)
-                l = l.reshape((6, 1))
-                qT.append(l)
-                line_count += 1
+    def start(self):
+        intrinsics_path = os.path.join(self.dataset_dir, 'intrinsics.json')
+        if os.path.exists(intrinsics_path):
+            f = json.load(open(intrinsics_path))
+            self.K = np.array(f['K']).reshape(3, 3)
+            self.distortion = np.array(f['distortion']).reshape(1, 5)
+            print('Camera Intrinsics loaded...')
+        else:
+            data_dict = self.process_all_images()
+            all_corners, all_ids = [], []
+            if data_dict:
+                all_image_names = data_dict.keys()
+                n_images = len(all_image_names)
+                for image_name in all_image_names:
+                    all_corners.append(data_dict[image_name]["corners"])
+                    all_ids.append(data_dict[image_name]["ids"])
+                    im_size = data_dict[image_name]["im_size"][:2]
+                print("Calibrating Camera Intrinsics...")
+                intrinsics_dict = self.get_camera_intrinsics(all_corners,
+                                                             all_ids, im_size)
+                self.K = intrinsics_dict["K"]
+                self.distortion = intrinsics_dict["distortion"]
+                json.dump(intrinsics_dict, open(intrinsics_path, 'w'))
+                B_X_C_stack = np.zeros((n_images, 4, 4))
+                camera_calib_path = os.path.join(self.dataset_dir,
+                                                 'camera_pose.json')
+                calibration_dict = {}
+                table_height = 0
+                for i, image_name in enumerate(all_image_names):
+                    corners_temp = data_dict[image_name]["corners"]
+                    ids_temp = data_dict[image_name]["ids"]
+                    if args.mode == "camera":
+                        print("Estimating Camera Pose w.r.t Robot Base...")
+                        B_X_C_stack[i] = self.get_ee_pose_wrt_cam(corners_temp,
+                                                              ids_temp)
+                        calibration_dict["B_X_C"] = self.SE3_avg(B_X_C_stack)
+                        json.dump(calibration_dict, open(camera_calib_path, 'w'))
+                    # Todo: if the table height calibration folder exist,
+                    #  calibrate table, else skip
+                    elif args.mode == "Table":
+                        if os.path.exists(camera_calib_path):
+                            data_temp = json.load(open(camera_calib_path, 'r'))
+                            B_X_C = data_temp["B_X_C"]
+                            table_height_temp =\
+                                self.get_table_height_from_sample(corners_temp)
+                        print()
 
-        self.camera_matrix = np.zeros(shape=(3,3))
-        self.distCoeffs = np.zeros(shape=(1,5))
-        self.rvecs = np.zeros(shape=(3,1))
-        self.tvecs = np.zeros(shape=(3,1))
-        self.current_markers = dict()
-        self.corners_all = dict()
-        self.ids_all = dict()
-        self.frame_counter = 0
-        self.im_size = dict()
-        self.calibOutput = []
-        self.l_B_C_mean = np.eye(3)
-        self.l_B_T_mean = np.eye(3)
-        self.R_B_C_mean = np.eye(3)
-        self.R_B_T_mean = np.eye(3)
-        self.t_B_C_mean = np.zeros((3,1))
-        self.t_B_T_mean = np.zeros((3,1))
-        self.X_M_T = np.eye(4) 
-        self.X_M_T[2,3] = -0.027 # offset between top of checkerboard and table
-        self.X_M_E = np.array([[0, -1, 0, 0.23],
-                                [-1, 0, 0, 0.19],
-                                [0, 0, -1, -0.011],
-                                [0, 0, 0, 1]])
-        self.X_E_T = np.matmul(np.linalg.inv(self.X_M_E),self.X_M_T) # offset between end-effector and table when board is on table
-        self.SE3_mean = np.eye(4)
-        self.current_markers = 0
-        self.corners_all = []
-        self.ids_all = []
-        self.im_size = ()
-        
-        # intrinsic calibration
-        for cam in range(camera):
-            self.frame_counter=0
-            for im in images:
-                if "cam{}".format(cam) in im:
-                    print(im)
-                    frame = cv2.imread(im)
-                    if self.frame_counter==0:
-                        self.im_size = frame.shape[:2]
-                    self.get_corners(frame)
-                    self.frame_counter=self.frame_counter+1 
-            self.intrinsic_calib()
 
-            # extrinsic calibration
-            calibratingCamera = True
-            calibratingTable = False
-            self.frame_counter=0
-            for im in images:
-                if "cam{}".format(cam) in im:
-                    frame = cv2.imread(im)
-                    self.est_board_pose(frame)
-                    self.get_ref_frames(calibratingCamera,calibratingTable,q[self.frame_counter])
-                    self.frame_counter=self.frame_counter+1
-            self.writeCameraYAML(cam)
-        
-        # table calibration
-        calibratingCamera = False
-        calibratingTable = True
-        self.frame_counter=0
-        for im in imagesT:
-            if "cam0" in im or camera == 1:
-                frame = cv2.imread(im)
-                self.est_board_pose(frame)
-                self.get_ref_frames(calibratingCamera,calibratingTable,qT[self.frame_counter])
-                self.frame_counter=self.frame_counter+1
-        self.writeRobotYAML()
+    def process_all_images(self):
+        image_dir = os.path.join(self.dataset_dir, 'images')
+        meta_dir = os.path.join(self.dataset_dir, 'meta')
+        all_meta_paths = glob.glob(os.path.join(meta_dir, '*.json'))
+        data_dict = {}
+        print("Extracting corners from all images")
+        for meta_path in tqdm(all_meta_paths):
+            meta = json.load(open(meta_path))
+            image_name = meta['image_name']
+            cv2_img = cv2.imread(os.path.join(image_dir, image_name))
+            corners_temp, ids_temp = self.get_corners(cv2_img)
+            if corners_temp is not None:
+                temp_dict = {"corners": corners_temp, "ids": ids_temp,
+                             "joint_config": meta["joint_config"],
+                             "im_size": cv2_img.shape}
+                data_dict[image_name] = temp_dict
+            else:
+                print('No enough corners detected, skip %s' % image_name)
+        return data_dict
 
-    def SO3Log(self,rotation):
-        # takes SO(3) to so(3)
+    @staticmethod
+    def get_camera_intrinsics(all_corners, all_ids, im_size):
         try:
-            theta = math.acos((np.matrix.trace(rotation)-1)/2)
+            _, cam_mat, dist_coeffs, _, _ = aruco.calibrateCameraCharuco(
+                charucoCorners=all_corners, charucoIds=all_ids,
+                board=charuco_board, imageSize=im_size,
+                cameraMatrix=None, distCoeffs=None)
+            print("K: {}".format(cam_mat[0:3]))
+            print("Dist coeffs: {}".format(dist_coeffs[0]))
+            return {"K": cam_mat.tolist(), "d": dist_coeffs.tolist()}
+        except:
+            print("Intrinsic calibration failed. Recalibrating...")
+
+    def get_ee_pose_wrt_cam(self, corners, ids, ref_frame='robotic'):
+        retval, rvecs, tvecs = aruco.estimatePoseCharucoBoard(
+            corners, ids, charuco_board, self.K, self.distortion)
+        if retval:
+            Ccv_X_M = np.eye(4)
+            Ccv_X_M[:3, 3] = tvecs[:3]
+            Ccv_X_M[0:3, 0:3] = cv2.Rodrigues(rvecs[:])[0]
+            Ccv_X_E = Ccv_X_M.dot(self.M_X_E)
+            E_X_Ccv = np.linalg.inv(Ccv_X_E)
+            if ref_frame == 'robotic':
+                return E_X_Ccv.dot(self.cv2robotics)
+            else:
+                return E_X_Ccv
+        else:
+            print('Board Pose not detected')
+            return None
+
+    def get_camera_pose_from_sample(self, corners, ids, joint_config):
+        E_X_C = self.get_ee_pose_wrt_cam(corners, ids)
+        if E_X_C is not None:
+            B_X_E = ur5_kin.get_ee_pose(joint_config)
+            return B_X_E.dot(E_X_C)
+        else:
+            return None
+
+    def get_table_height_from_sample(self, corners, ids, B_X_C, joint_config):
+        E_X_C = self.get_ee_pose_wrt_cam(corners, ids)
+        if E_X_C is not None:
+            B_X_T_vision = B_X_C.dot(np.linalg.inv(E_X_C)).dot(self.E_X_T)
+            height_from_vision = B_X_T_vision[2, 3]
+            B_X_E = ur5_kin.get_ee_pose(joint_config)
+            B_X_T_kin = B_X_E.dot(self.E_X_T)
+            height_from_kin = B_X_T_kin[2, 3]
+            err = height_from_kin - height_from_vision
+            print("Error: {}".format(err))
+            return height_from_kin
+        else:
+            return None
+
+    @staticmethod
+    def get_corners(cv2_img):
+        gray_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = aruco.detectMarkers(image=gray_img,
+                                              dictionary=aruco_dict)
+        if ids is not None and len(ids) > 5:
+            _, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(
+                corners, ids, gray_img, charuco_board)
+            return charuco_corners, charuco_ids
+        else:
+            # Todo: print image id
+            print("Too few markers detected, skip...")
+            return None, None
+    @staticmethod
+    def SO3_log(_SO3):
+        try:
+            theta = math.acos((np.matrix.trace(_SO3) - 1) / 2)
         except:
             theta = 0.0
-        coeff = 0
-        if (abs(theta)<1e-8):
+        if abs(theta) < 1e-8:
             coeff = 0.5
         else:
-            coeff = theta/(2*math.sin(theta))
-        return coeff * (rotation - np.matrix.transpose(rotation))
+            coeff = theta / (2 * math.sin(theta))
+        return coeff * (_SO3 - np.matrix.transpose(_SO3))
 
-    def vex(self,m):
-        v = np.zeros(shape=(3,1))
-        v[0,0] = m[2,1]
-        v[1,0] = m[2,0]
-        v[2,0] = m[1,0]
-        return v
-    
-    def so3Exp(self,vel):
-        # takes so(3) to SO(3)
-        w = self.vex(vel)
+    @staticmethod
+    def so3_to_vec(_so3):
+        return np.array([_so3[2, 1], _so3[0, 2], _so3[1, 0]]).reshape(3, 1)
+
+    def so3_exp(self, _so3):
+        w = self.so3_to_vec(_so3).reshape(3)
         th = np.linalg.norm(w)
-        A=1
-        B=0.5
-        if abs(th) >= 1e-12:
-            A = math.sin(th)/th
-            B = (1-math.cos(th))/pow(th,2)
-        return np.eye(3) + A.dot(vel) + B.dot(vel).dot(vel)
+        A = 1
+        B = 0.5
+        if abs(th) >= 1e-8:
+            A = math.sin(th) / th
+            B = (1 - math.cos(th)) / pow(th, 2)
+        return np.eye(3) + A * _so3 + B * _so3.dot(_so3)
 
-    def SO3_averaging(self, Rs):
+    def SO3_avg(self, SO3_stack, err_th=0.01):
         # implement Karcher mean / geodesic L2-mean on SO(3)
-        n = Rs.shape[0]
-        R = Rs[0, :, :]
-        r = np.zeros([3, 3])
+        n = SO3_stack.shape[0]
+        out = SO3_stack[0, :, :]
         err = 100
-        th = 0.01
-        while err > th:
+        while err > err_th:
+            _so3_err_sum = np.zeros([3, 3])
             for i in range(n):
-                r += self.SO3Log(np.transpose(R).dot(Rs[i, :, :]))
-            r = r/n
-            R = R.dot(self.so3Exp(r))
-            err = np.linalg.norm(r)
-            print(err)
-        return R
-    
-    def writeRobotYAML(self):
-        with open(robotYAML, 'w') as f:    
-            yaml.dump({"X_B_E": self.X_B_E.tolist(),
-            "X_B_T": self.X_B_T.tolist(),
-            "Error": self.E.tolist()}, f, default_flow_style=False)
+                _so3_err_sum += self.SO3_log(
+                    np.transpose(out).dot(SO3_stack[i, :, :]))
+            out = out.dot(self.so3_exp(_so3_err_sum/n))
+            err = np.linalg.norm(_so3_err_sum)
+            # print(err)
+        return out
 
-    def writeCameraYAML(self, cam_id):
-        with open("{}cam{}_{}".format(rootDir, cam_id, cameraYAML), 'w') as f:    
-            yaml.dump({"K": self.camera_matrix.tolist(),
-            "distortion": self.distCoeffs.tolist(),
-            "X_B_C": self.X_B_C.tolist()}, f, default_flow_style=False)
-
-    def intrinsic_calib(self):
-        cameraMatrixInit = np.array([[ 1000.,    0., self.im_size[0]/2.],
-                                 [    0., 1000., self.im_size[1]/2.],
-                                 [    0.,    0.,           1.]])
-        try:
-            _, cameramatrix, distcoeffs, _, _ = aruco.calibrateCameraCharuco(
-            charucoCorners=self.corners_all,
-            charucoIds=self.ids_all,
-            board=charuco_board,
-            imageSize=self.im_size,
-            cameraMatrix=cameraMatrixInit,
-            distCoeffs=None)
-            print("K: {}".format(cameramatrix[0:3]))
-            print("Dist coeffs: {}".format(distcoeffs[0]))
-            self.camera_matrix[:,:] = cameramatrix
-            self.distCoeffs[:,:] = distcoeffs
-            self.calibOutput.append({"K": cameramatrix.tolist(),
-                "d": distcoeffs.tolist()})
-        except: 
-            print("Intrinsic calibration failed. Recalibrating...")
-            self.frame_counter = 0 
-
-    def get_corners(self,cv2_img):
-        gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = aruco.detectMarkers(image=gray,dictionary=aruco_dict)  
-        if ids is not None and len(ids) > 5: 
-            _, Chcorners, Chids = aruco.interpolateCornersCharuco(corners, ids, gray, charuco_board )  
-            self.current_markers = len(Chcorners)
-            self.corners_all.append(Chcorners)
-            self.ids_all.append(Chids)      
-
-    def est_board_pose(self,cv2_img):
-        gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = aruco.detectMarkers(image=gray,dictionary=aruco_dict)  
-        if ids is not None and len(ids) > 5: 
-            _, Chcorners, Chids = aruco.interpolateCornersCharuco(corners, ids, gray, charuco_board )  
-            retval, rvecs, tvecs = aruco.estimatePoseCharucoBoard(Chcorners, Chids, charuco_board, self.camera_matrix[:,:], self.distCoeffs[:,:]) 
-            #######################
-            X_C_M = np.eye(4)
-            X_C_M[0, 3] = tvecs[0]
-            X_C_M[1, 3] = tvecs[1]
-            X_C_M[2, 3] = tvecs[2]
-            R = cv2.Rodrigues(rvecs[:])[0]
-            X_C_M[0:3, 0:3] = R
-            X_C_E = X_C_M.dot(self.X_M_E)
-            tvecs_new = X_C_E[:3, 3]
-            rvecs_new = cv2.Rodrigues(X_C_E[0:3, 0:3])[0]
-            # #####################
-            QueryImg = aruco.drawDetectedCornersCharuco(cv2_img, Chcorners, Chids,(0,0,255))
-            if( retval ):
-                QueryImg = aruco.drawAxis(cv2_img, self.camera_matrix[:,:], self.distCoeffs[:,:], rvecs, tvecs, 0.032)  
-                QueryImg = aruco.drawAxis(QueryImg, self.camera_matrix[:,:], self.distCoeffs[:,:], rvecs_new, tvecs_new, 0.032)  
-
-            # Display our image
-            # cv2.imshow('QueryImage', QueryImg)
-            # cv2.waitKey(0)    
-        else:
-            rvecs = np.zeros((3, 1))
-            tvecs = np.zeros((3, 1))
-            cv2.imshow('QueryImage', cv2_img)
-            print("board not detected")
-            cv2.waitKey(1) 
-        #print("{} markers detected".format(len(ids)))      
-        self.tvecs = tvecs
-        self.rvecs= rvecs
-       
-    def get_ref_frames(self, calibratingCamera, calibratingTable,q):
-        X_C_M = np.zeros((4, 4))
-        X_C_M[3, 3] = np.ones(1)
-        X_C_M[0, 3] = self.tvecs[0]
-        X_C_M[1, 3] = self.tvecs[1]
-        X_C_M[2, 3] = self.tvecs[2]
-        X_C_M[0:3, 0:3] = cv2.Rodrigues(self.rvecs[:])[0]
-        Q = np.array([[0,-1, 0, 0],
-                     [0, 0, -1, 0],
-                     [1, 0, 0, 0],
-                     [0, 0, 0, 1]])# Transform from cv convention to robotic
-        X_C_E = X_C_M.dot(self.X_M_E) # cv frame
-        X_E_C = np.linalg.inv(X_C_E).dot(Q) # robot frame
-        self.X_B_E = fk_ur5.get_ee_pose(q) # current pose of end effector wrt ur5 base
-        # print("X_B_E: {}".format(self.X_B_E))
-        if calibratingCamera == True:           
-            self.X_B_C = self.X_B_E.dot(X_E_C) 
-            #print("X_B_C: {}".format(self.X_B_C))
-
-            if self.frame_counter == 0:
-                self.R_B_C_0 = self.X_B_C[0:3, 0:3]
-            l_B_C = self.SO3_averaging(np.matmul(np.transpose(self.R_B_C_0),self.X_B_C[0:3,0:3]))
-            self.l_B_C_mean = (self.l_B_C_mean*self.frame_counter + l_B_C) / (self.frame_counter + 1)
-            self.R_B_C_mean = np.matmul(self.R_B_C_0, self.so3Exp(self.l_B_C_mean))
-            self.t_B_C_mean = (self.t_B_C_mean*self.frame_counter + self.X_B_C[0:3,3].reshape((3,1))) / (self.frame_counter + 1)
-            self.X_B_C_mean = np.zeros((4,4))
-            self.X_B_C_mean[3,3] = 1
-            self.X_B_C_mean[0:3, 0:3] = self.R_B_C_mean
-            self.X_B_C_mean[0,3] = self.t_B_C_mean[0,0]
-            self.X_B_C_mean[1,3] = self.t_B_C_mean[1,0]
-            self.X_B_C_mean[2,3] = self.t_B_C_mean[2,0]
-            #print("X_B_C_mean: {}".format(self.X_B_C_mean))
-
-        elif calibratingTable == True: # calibrate table
-            X_C_T = np.linalg.inv(Q).dot(X_C_M.dot(self.X_M_T)) # world frame
-            self.X_B_T = np.matmul(self.X_B_C_mean, X_C_T)
-            #print("X_B_T: {}".format(self.X_B_T))
-            
-            if self.frame_counter == 0:
-                self.R_B_T_0 = self.X_B_T[0:3, 0:3]
-            l_B_T = self.SO3_averaging(np.matmul(np.transpose(self.R_B_T_0),self.X_B_T[0:3,0:3]))
-            self.l_B_T_mean = (self.l_B_T_mean*self.frame_counter + l_B_T) / (self.frame_counter + 1)
-            self.R_B_T_mean = np.matmul(self.R_B_T_0, self.so3Exp(self.l_B_T_mean))
-            self.t_B_T_mean = (self.t_B_T_mean*self.frame_counter + self.X_B_T[0:3,3].reshape((3,1))) / (self.frame_counter + 1)
-            X_B_T_mean = np.zeros((4,4))
-            X_B_T_mean[3,3] = 1
-            X_B_T_mean[0:3, 0:3] = self.R_B_T_mean
-            X_B_T_mean[0,3] = self.t_B_T_mean[0,0]
-            X_B_T_mean[1,3] = self.t_B_T_mean[1,0]
-            X_B_T_mean[2,3] = self.t_B_T_mean[2,0]
-            #print("X_B_T_mean: {}".format(X_B_T_mean))           
-                        
-            #print("Table Height w.r.t Base: %.6f" % X_B_T_mean[2, 3])
-            X_B_T_from_fk = self.X_B_E.dot(self.X_E_T)
-            X_B_T_from_vision = self.X_B_T
-            self.E = np.linalg.norm(X_B_T_from_fk - X_B_T_from_vision) # error function
-            print("Error: {}".format(self.E))
-
-def main():
-    aruco_calib = chArucoCalib()
+    def SE3_avg(self, SE3_stack):
+        out = np.eye(4)
+        out[:, 3] = np.mean(SE3_stack[:, :, 3], axis=0)
+        out[:3, :3] = self.SO3_avg(SE3_stack[:, :3, :3])
+        return out
 
 if __name__ == "__main__":
     main()
