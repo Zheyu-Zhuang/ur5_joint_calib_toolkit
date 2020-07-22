@@ -1,5 +1,6 @@
 # Mutli-Camera - UR5 Robotic Arm Calibration Package
 
+![optional caption text](Documents/robotic_vision_logo.jpg)
 
 ## Package Overview
 This software package uses OpenCV and Python to implement calibration of a multi-camera system with a UR5 robot arm. Software for data collection (image and joint angles) is included, implemented with ROS and Python. The package is currently implemented to calibrate a UR5 robot arm with either a PointGrey or ZED camera, however the calibration is general and other robotic or camera platforms can be used if the image and robotic end-effector pose are provided.
@@ -8,9 +9,6 @@ This software package uses OpenCV and Python to implement calibration of a multi
 In order to run the software with a UR5 robot arm using either a Point Grey or ZED camera we used the following software packages:
 
 * [OpenCV][cv]
-* [UR5 Ros Wrapper][ros]
-* [ZED Ros Wrapper][zed]
-* [PointGrey Ros Wrapper][pg]
 
 ChAruco calibration boards can be generated [here][board].
 
