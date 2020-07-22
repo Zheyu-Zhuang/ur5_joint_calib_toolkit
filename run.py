@@ -1,34 +1,15 @@
+import cv2
+import glob
+import json
 import os
 
-# ROS Sys Pkg
-import json
-import argparse
-import cv2
 import cv2.aruco as aruco
-import glob
-from spatial_transform import *
-from ur5_kinematics import UR5Kinematics as UR5Kin
 from tqdm import tqdm
 
+from lib.cfg import args, aruco_dict, charuco_board
+from lib.spatial_transform import *
+from lib.ur5_kinematics import UR5Kinematics as UR5Kin
 
-parser = argparse.ArgumentParser()
-#
-parser.add_argument('--dataset', type=str, help='directory for saving the data')
-#
-parser.add_argument('--aruco_bit', type=int, default=4,
-                    help='format of aruco dictionary')
-parser.add_argument('--board_dim', type=int, nargs="+", default=[4, 6],
-                    help='width, height of checkerboard (unit: squares)')
-parser.add_argument('--square_len', type=float, default=0.029,
-                    help='measured in metre')
-parser.add_argument('--marker_len', type=float, default=0.022,
-                    help='measured in metre')
-args = parser.parse_args()
-
-aruco_dict = aruco.Dictionary_get(aruco.DICT_4X4_1000)  # 4X4 = 4x4 bit markers
-charuco_board = aruco.CharucoBoard_create(args.board_dim[0], args.board_dim[1],
-                                          args.square_len, args.marker_len,
-                                          aruco_dict)
 ur5_kin = UR5Kin()
 
 
@@ -45,7 +26,7 @@ class MVC:
         self.E_X_T = np.matmul(np.linalg.inv(self.M_X_E),
                                self.board_height_offset)
         self.cv2robotics = np.array([[0, -1, 0, 0], [0, 0, -1, 0],
-                                    [1, 0, 0, 0], [0, 0, 0, 1]])
+                                     [1, 0, 0, 0], [0, 0, 0, 1]])
 
     def start(self):
         root, sub_dirs, _ = os.walk(
